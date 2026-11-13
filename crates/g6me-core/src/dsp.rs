@@ -22,8 +22,8 @@
 //! the arithmetic noise floor moved down. Both properties hold only because
 //! every operation here is a single, explicitly ordered IEEE-754 `+`, `-` or
 //! `*`. The following are therefore forbidden in this module, and
-//! `crates/g6me-verify/tests/asm_guard.rs` fails the build if they appear in
-//! the generated assembly:
+//! the `asm` group of `g6me-verify` (`crates/g6me-verify/src/checks.rs`) fails if
+//! they appear in the generated assembly:
 //!
 //! * **FMA / `fma()`** — fusing `b0*x` into the following subtraction changes
 //!   which roundings happen. In a recursive (IIR) section that error does not

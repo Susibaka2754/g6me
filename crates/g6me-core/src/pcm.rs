@@ -77,12 +77,89 @@ impl BitDepth {
         }
     }
 
-    /// Why 24-bit is quantized by the encoder and not by a filter: libswresample
-    /// has no `s24` sample format (`S24` maps to `s32` above), so a "24-bit"
-    /// render is produced by the encoder's own `pcm_s24le` conversion, with
-    /// dither still requested from `aresample` upstream of it.
+    /// Why 24-bit is quantized here and not by a filter: libswresample has no `s24`
+    /// sample format (`S24` maps to `s32` above), and ffmpeg's 24-bit encoders keep the
+    /// top 24 bits of that `s32` -- a floor, half an LSB low on average, dither
+    /// included. [`Grid24`] rounds onto the 24-bit grid first, so the encoder's
+    /// truncation drops only zeros.
     pub fn quantize_note() -> &'static str {
-        "24-bit is quantized by the encoder (pcm_s24le); libswresample has no s24 sample format"
+        "24-bit is rounded (and dithered) by g6me before the encoder; ffmpeg's own s32->s24 \
+         step truncates"
+    }
+}
+
+/// Rounds a stereo stream onto the 24-bit grid, optionally with dither, before it
+/// reaches an encoder that would otherwise truncate it (see [`BitDepth::quantize_note`]).
+///
+/// Only the plain dithers are offered: ffmpeg's noise-shaped methods are not
+/// reproduced here, and at 24 bits its own versions diverge.
+#[derive(Clone, Debug)]
+pub struct Grid24 {
+    dither: Dither,
+    rng: u64,
+    /// Previous uniform draw per channel, for the high-passed triangular dither.
+    prev: [f64; 2],
+}
+
+impl Grid24 {
+    const SCALE: f64 = 8_388_608.0; // 2^23
+    const MAX: f64 = 8_388_607.0;
+
+    /// Dithers this quantizer can apply at 24 bits.
+    pub fn supports(d: Dither) -> bool {
+        matches!(
+            d,
+            Dither::None | Dither::Rectangular | Dither::Triangular | Dither::TriangularHp
+        )
+    }
+
+    /// `None` for a dither [`Grid24::supports`] refuses.
+    pub fn new(dither: Dither) -> Option<Self> {
+        Self::supports(dither).then_some(Self {
+            dither,
+            // Fixed seed: two renders of one file stay byte-identical.
+            rng: 0x9E37_79B9_7F4A_7C15,
+            prev: [0.0; 2],
+        })
+    }
+
+    /// Uniform in [-0.5, 0.5), xorshift64*.
+    fn uniform(&mut self) -> f64 {
+        self.rng ^= self.rng >> 12;
+        self.rng ^= self.rng << 25;
+        self.rng ^= self.rng >> 27;
+        let v = self.rng.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        (v >> 11) as f64 / (1u64 << 53) as f64 - 0.5
+    }
+
+    fn noise(&mut self, ch: usize) -> f64 {
+        match self.dither {
+            Dither::Rectangular => self.uniform(),
+            Dither::Triangular => self.uniform() + self.uniform(),
+            Dither::TriangularHp => {
+                let u = self.uniform();
+                let n = u - self.prev[ch];
+                self.prev[ch] = u;
+                n
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// Quantize both channels in place, frame by frame.
+    pub fn process(&mut self, l: &mut [f64], r: &mut [f64]) {
+        for (a, b) in l.iter_mut().zip(r.iter_mut()) {
+            let (da, db) = (self.noise(0), self.noise(1));
+            *a = Self::snap(*a, da);
+            *b = Self::snap(*b, db);
+        }
+    }
+
+    fn snap(x: f64, noise: f64) -> f64 {
+        (x * Self::SCALE + noise)
+            .round_ties_even()
+            .clamp(-Self::SCALE, Self::MAX)
+            / Self::SCALE
     }
 }
 
@@ -262,5 +339,74 @@ mod tests {
         assert_eq!(Stats::dbfs(1.0), 0.0);
         assert!(Stats::dbfs(0.0).is_nan() || Stats::dbfs(0.0) == f64::NEG_INFINITY);
         assert!((Stats::dbfs(0.5) + 6.0206).abs() < 0.01);
+    }
+
+    /// What ffmpeg's 24-bit encoders do with the `s32` they are handed.
+    fn encoder_s24(x: f64) -> i64 {
+        let s32 = (x * 2147483648.0)
+            .round_ties_even()
+            .clamp(-2147483648.0, 2147483647.0) as i64;
+        s32 >> 8
+    }
+
+    fn error_after_encoder(d: Dither) -> (f64, f64) {
+        let mut g = Grid24::new(d).unwrap();
+        let mut seed = 1u64;
+        let src: Vec<f64> = (0..20_000)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 1e-3
+            })
+            .collect();
+        let (mut l, mut r) = (src.clone(), src.clone());
+        g.process(&mut l, &mut r);
+        let e: Vec<f64> = l
+            .iter()
+            .zip(&src)
+            .map(|(&q, &x)| encoder_s24(q) as f64 - x * 8_388_608.0)
+            .collect();
+        let mean = e.iter().sum::<f64>() / e.len() as f64;
+        let max = e.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        (mean, max)
+    }
+
+    #[test]
+    fn grid24_output_survives_the_encoders_truncation_unbiased() {
+        // Without the grid, the encoder alone sits half an LSB low.
+        let raw: f64 = (0..1000)
+            .map(|i| encoder_s24(i as f64 * 1.37e-7) as f64 - i as f64 * 1.37e-7 * 8_388_608.0)
+            .sum::<f64>()
+            / 1000.0;
+        assert!(raw < -0.4, "the bias this exists for: {raw}");
+
+        let (mean, max) = error_after_encoder(Dither::None);
+        assert!(mean.abs() < 0.02 && max <= 0.5 + 1e-9, "none: {mean} {max}");
+        for d in [
+            Dither::Rectangular,
+            Dither::Triangular,
+            Dither::TriangularHp,
+        ] {
+            let (mean, max) = error_after_encoder(d);
+            assert!(mean.abs() < 0.03, "{d:?} biased: {mean}");
+            assert!(
+                max > 0.5 && max <= 1.5 + 1e-9,
+                "{d:?} noise out of range: {max}"
+            );
+        }
+    }
+
+    #[test]
+    fn grid24_clamps_full_scale_and_refuses_noise_shaping() {
+        let mut g = Grid24::new(Dither::None).unwrap();
+        let (mut l, mut r) = (vec![1.0, -1.0, 2.0], vec![0.0; 3]);
+        g.process(&mut l, &mut r);
+        assert_eq!(
+            l,
+            vec![8_388_607.0 / 8_388_608.0, -1.0, 8_388_607.0 / 8_388_608.0]
+        );
+        assert!(Grid24::new(Dither::Shibata).is_none());
+        assert!(Grid24::new(Dither::LowShibata).is_none());
     }
 }

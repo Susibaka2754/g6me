@@ -155,6 +155,37 @@ struct Row {
     dst: PathBuf,
     phase: Phase,
     note: String,
+    /// Why this file's destination is not the obvious one, from discovery.
+    ///
+    /// Kept apart from `note` on purpose: `note` is overwritten by the runner the moment
+    /// the file starts, and a file that had to be written somewhere other than where its
+    /// name pointed is worth knowing before it runs, not just after.
+    collision: String,
+}
+
+impl Row {
+    /// The one line to show beside the file name: the result if the file has run, and
+    /// otherwise the reason its output path moved.
+    fn shout(&self) -> &str {
+        if self.note.is_empty() {
+            &self.collision
+        } else {
+            &self.note
+        }
+    }
+
+    fn tooltip(&self) -> String {
+        let mut s = format!("\u{2192} {}", self.dst.display());
+        if !self.collision.is_empty() {
+            s.push('\n');
+            s.push_str(&self.collision);
+        }
+        if !self.note.is_empty() {
+            s.push('\n');
+            s.push_str(&self.note);
+        }
+        s
+    }
 }
 
 pub struct App {
@@ -629,7 +660,7 @@ impl App {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| row.src.display().to_string());
         let status = if finished {
-            truncate(&row.note, 44)
+            truncate(row.shout(), 44)
         } else {
             "rendering".to_string()
         };
@@ -724,15 +755,15 @@ impl App {
                             let resp = ui
                                 .horizontal(|ui| {
                                     ui.colored_label(col, head);
-                                    if !r.note.is_empty() {
-                                        ui.weak(truncate(&r.note, 40));
+                                    if !r.shout().is_empty() {
+                                        ui.weak(truncate(r.shout(), 40));
                                     }
                                     if !running && ui.small_button("✕").clicked() {
                                         remove = Some(i);
                                     }
                                 })
                                 .response
-                                .on_hover_text(format!("→ {}\n{}", r.dst.display(), r.note));
+                                .on_hover_text(r.tooltip());
                             let _ = resp;
                         }
                         // Removed after the loop: the table is borrowed while it is
@@ -1341,16 +1372,20 @@ impl App {
                 }
             });
             ui.horizontal(|ui| {
-                ui.label("max length");
+                ui.label("convolution length");
                 let mut l = self.settings.ir_length;
+                // A fraction, because that is the unit FFmpeg's afir defines. The old
+                // 0..8 "seconds" control happily produced values afir refuses outright
+                // ("out of range [0 - 1]", exit 222), which surfaced as a failed render
+                // with a filter-graph message that never mentioned this control.
                 ui.add(
                     egui::DragValue::new(&mut l)
                         .speed(0.02)
-                        .range(0.0..=8.0)
-                        .suffix(" s"),
+                        .range(0.0..=1.0)
+                        .fixed_decimals(2),
                 );
                 self.settings.ir_length = l;
-                ui.weak("(0 = whole IR)");
+                ui.weak("(fraction of the IR; 0 or 1 = whole)");
             });
             ui.weak(
                 "Convolution runs in double precision, fixed — the mpv equivalent of \
@@ -1601,6 +1636,7 @@ impl App {
                 dst: i.dst.clone(),
                 phase: i.phase,
                 note: String::new(),
+                collision: i.note.clone().unwrap_or_default(),
             })
             .collect();
         let skipped = self
@@ -1654,6 +1690,7 @@ impl App {
                         dst: i.dst.clone(),
                         phase: i.phase,
                         note: String::new(),
+                        collision: i.note.clone().unwrap_or_default(),
                     })
                     .collect();
                 self.status = format!("rendering {} file(s)", items.len());

@@ -96,9 +96,13 @@ impl Meters {
             // Clamped, not cast. The plugin this reproduces stored the peak in a float too,
             // but its samples came from a float buffer, so it could not meet an f64 above
             // f32::MAX; a bare `as f32` of one yields +inf, which [`Self::hold`] would then
-            // latch. `f64::min` returns the other operand when one is NaN, so a NaN sample
-            // is skipped rather than becoming the peak.
-            let v = x.to_f64().abs().min(f64::from(f32::MAX)) as f32;
+            // latch. A non-finite sample is skipped, not clamped: `f64::min` returns the
+            // other operand when one is NaN, so clamping turned a NaN into f32::MAX.
+            let a = x.to_f64().abs();
+            if !a.is_finite() {
+                continue;
+            }
+            let v = a.min(f64::from(f32::MAX)) as f32;
             if v > peak {
                 peak = v;
             }
@@ -327,6 +331,25 @@ mod tests {
         assert_eq!(m.peak(8), 0.75);
         assert_eq!(m.peak(9), 0.05);
         assert_eq!(m.frames(), 4);
+    }
+
+    /// A non-finite sample is not a level: it must neither become the peak nor hide
+    /// the finite samples around it.
+    #[test]
+    fn non_finite_samples_are_skipped() {
+        let m = Meters::new();
+        m.set_format(48000.0, 4);
+        let l = [f64::NAN, 0.25, 0.0, 0.0];
+        let r = [0.5f64, f64::INFINITY, f64::NEG_INFINITY, 0.0];
+        let planar: [Option<&[f64]>; crate::dsp::SLOTS] = [None; crate::dsp::SLOTS];
+        m.observe_block(&planar, &l, &r, 4);
+        assert_eq!(m.peak(IN_CHANNELS), 0.25);
+        assert_eq!(m.peak(IN_CHANNELS + 1), 0.5);
+        // An f64 beyond f32 range is still clamped rather than skipped.
+        m.reset();
+        let big = [1e300f64, 0.0, 0.0, 0.0];
+        m.observe_block(&planar, &big, &big, 4);
+        assert_eq!(m.peak(IN_CHANNELS), f32::MAX);
     }
 
     #[test]

@@ -15,9 +15,11 @@
 //! group delay of its own that the limiter cannot see ahead of, and a limiter whose
 //! idea of "now" is smeared cannot honour a hard ceiling.
 //!
-//! Gain is channel-linked: one gain for every channel of the group. Per-channel gains
-//! would change the level relationships the matrix exists to create, which makes the
-//! processor change the thing the product is.
+//! Gain is channel-linked by degree: [`Cfg::link_transient`] and [`Cfg::link_release`]
+//! blend each channel's own gain with the group's, the fast stage fully linked by default
+//! and the slow stage at 75 %. Fully independent gains would change the level
+//! relationships the matrix exists to create, which makes the processor change the thing
+//! the product is.
 //!
 //! ```text
 //!  input[i] ──► per-channel TP detector ──► p[i] ──► window minimum over the
@@ -45,7 +47,7 @@
 //! [`Cfg::lookahead_samples`] applies that floor, and [`Cfg::effective_lookahead_ms`]
 //! reports what was actually used: a request below the floor is raised, never
 //! silently honoured short. At 48 kHz and x8 (the default) the floor is 29 samples,
-//! 0.60 ms, so the 1 ms default fits and a 0.2 ms request is raised to 0.60 ms; the
+//! 0.60 ms, so the 2 ms default fits and a 0.2 ms request is raised to 0.60 ms; the
 //! Kaiser banks have a 25-sample group delay because their transition band is narrow
 //! (see [`crate::tp::BAND_EDGE`]). The report says so whenever it happens.
 //!
@@ -60,11 +62,6 @@ use crate::tp::{Detector, Ratio, TruePeak};
 /// Linear attack time. Short enough to catch a single-cycle transient, long enough
 /// that the gain change is not a step in the output.
 pub const ATTACK_MS: f64 = 0.5;
-
-/// Time for the gain to return to unity after a peak, as a one-pole time constant.
-/// Too short and the limiter pumps on every drum; too long and it rides below unity
-/// through material that needed no limiting at all.
-pub const RELEASE_MS: f64 = 120.0;
 
 /// The limiter's own share of the ceiling guard band, in dB.
 ///
@@ -459,7 +456,8 @@ impl Report {
     /// This is the control loop grading itself: the gain was chosen with this detector and
     /// `post_dbtp` is measured with it, so a `true` here can only confirm the limiter's
     /// belief. It is a unit-test oracle and a sanity check, not evidence. The delivered
-    /// file is checked by an independent meter in `pipeline::Report::verified`.
+    /// stream and file are measured by independent meters, reported as
+    /// `pipeline::Report::true_peak_dbtp` and `pipeline::Report::delivered`.
     #[must_use]
     pub fn within_ceiling(&self) -> bool {
         self.post_dbtp <= self.ceiling_db
@@ -702,7 +700,7 @@ impl Limiter {
     /// Post-limiter true peak per channel, dBTP.
     ///
     /// [`Report::post_dbtp`] is the group maximum, because that is what the ceiling is
-    /// judged against — one gain for the whole group means one number that has to hold.
+    /// judged against — the ceiling holds for every channel, so one number has to hold.
     /// A meter panel wants the breakdown, and the difference is not cosmetic: on 5.1
     /// material the group maximum and the loudest single channel can disagree by several
     /// dB once the LFE is in the group.
@@ -718,6 +716,16 @@ impl Limiter {
             crate::tp::db_from_peak(self.side.iter().map(Detector::peak).fold(0.0, f64::max));
         r.post_dbtp = self.out_meter.dbtp();
         r
+    }
+
+    /// Transient gain channel `c` needs for the peak just reported, after the slow stage.
+    fn required(&self, c: usize) -> f64 {
+        let after = (self.peaks[c] * self.gr_now[c]).max(f64::MIN_POSITIVE);
+        if after > self.ceiling_lin {
+            self.ceiling_lin / after
+        } else {
+            1.0
+        }
     }
 
     /// Slot for an input-frame index on the ring.
@@ -950,32 +958,32 @@ impl Limiter {
         }
 
         // --- required transient gain, on the frame the peaks actually describe ----------
-        // The detector reports a peak `delta` frames after the input frame it describes,
-        // and the first `delta` feeds describe nothing yet. Computed *after* the slow
-        // stage and against what is left of the peak once that stage has had it.
-        if self.fed > self.delta as u64 {
-            let m = self.fed - 1 - self.delta as u64;
-            let slot = self.slot(m);
-            let mut group = 1.0f64;
-            for c in 0..nch {
-                let after = (self.peaks[c] * self.gr_now[c]).max(f64::MIN_POSITIVE);
-                let req = if after > self.ceiling_lin {
-                    self.ceiling_lin / after
-                } else {
-                    1.0
-                };
-                self.req_ring[c][slot] = req;
-                self.gr_ring[c][slot] = self.gr_now[c];
-                if req < group {
-                    group = req;
-                }
+        // The detector reports a peak `delta` frames after the input frame it describes.
+        // The first `delta` feeds have no frame of their own, but they already read the
+        // opening samples (a reading depends on the last `2 * delta` inputs at most), so
+        // they are folded into frame 0's demand, whose neighbourhood spans all of them.
+        // Computed *after* the slow stage and against what is left of the peak once that
+        // stage has had it.
+        let m = self.fed.saturating_sub(1 + self.delta as u64);
+        let slot = self.slot(m);
+        let mut group = 1.0f64;
+        for c in 0..nch {
+            let req = self.required(c);
+            if req < group {
+                group = req;
             }
+        }
+        for c in 0..nch {
+            let mut req = self.required(c);
             if self.cfg.link_transient > 0.0 {
-                for c in 0..nch {
-                    let own = self.req_ring[c][slot];
-                    self.req_ring[c][slot] = blend(own, group, self.cfg.link_transient);
-                }
+                req = blend(req, group, self.cfg.link_transient);
             }
+            // Frame 0's slot still holds its construction value of 1.0 on the first feed.
+            if m == 0 {
+                req = req.min(self.req_ring[c][slot]);
+            }
+            self.req_ring[c][slot] = req;
+            self.gr_ring[c][slot] = self.gr_now[c];
         }
 
         // A frame's schedule can still be deepened by input arriving up to `2 * delta`
@@ -1140,6 +1148,51 @@ mod tests {
         }
     }
 
+    /// The ceiling is a promise, and a promise is only worth what it holds for at the
+    /// settings most likely to break it: a deep cut (a lot of gain reduction to slew), the
+    /// shortest lookahead the API accepts (no time to arrange the reduction in advance),
+    /// and the ratios that make each decibel of overage demand the most reduction.
+    ///
+    /// This is the answer to "a short lookahead needs a wider guard band". It does not:
+    /// every cell of this grid came out under its ceiling, so `Cfg::guard_db()` already
+    /// covers the short-lookahead case and inflating it further would only make the meter
+    /// pessimistic about a risk that is not there.
+    ///
+    /// Sabotage check: set `GAIN_SLEW_GUARD_DB` to 0 and this fails — measured at
+    /// +0.0035 dB over the ceiling with lookahead 0.2 ms, ratio x32, ceiling -12 dBTP —
+    /// so the guard is doing real work and 0.02 dB is enough of it. That is the whole
+    /// answer to asking for a wider band: the margin is earned at the worst cell in the
+    /// grid, not guessed at.
+    #[test]
+    fn the_ceiling_holds_across_ratios_lookahead_and_depth() {
+        let mut worst = f64::NEG_INFINITY;
+        let mut at = String::new();
+        let mut cells = 0usize;
+        for la in [MIN_LOOKAHEAD_MS, 1.0, MAX_LOOKAHEAD_MS] {
+            for ratio in [Ratio::X2, Ratio::X4, Ratio::X8, Ratio::X16, Ratio::X32] {
+                for &ceil in &[-1.0, -3.0, -6.0, -12.0, -18.0] {
+                    let c = cfg(ceil, ratio, la);
+                    for (i, m) in probe_materials().into_iter().enumerate() {
+                        let (_, r) = run(c, &[m], 333);
+                        cells += 1;
+                        let margin = r.post_dbtp - ceil;
+                        if margin > worst {
+                            worst = margin;
+                            at = format!(
+                                "lookahead {la} ms, {ratio:?}, ceiling {ceil} dBTP, material #{i}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            worst <= 0.0,
+            "post-limiter true peak sat {worst:+.4} dB over its ceiling at {at} \
+             ({cells} configurations)"
+        );
+    }
+
     fn burst(f: f64, amp: f64, n: usize, phase: f64) -> Vec<f64> {
         (0..n)
             .map(|i| amp * (2.0 * std::f64::consts::PI * f * i as f64 / FS + phase).sin())
@@ -1285,12 +1338,14 @@ mod tests {
 
     /// A peak that arrives in the first frames of a file still cannot beat the ceiling.
     ///
-    /// Nothing precedes a burst at frame 1, so there is no history in the bank to smooth it
+    /// Nothing precedes a crest at frame 0, so there is no history in the bank to smooth it
     /// and no earlier gain to lean on; the limiter meets it with whatever it can schedule
-    /// from a cold start. The burst is Nyquist-alternating because an interpolating lowpass
-    /// is in its own transition band there, which leaves the sample-peak floor as the only
-    /// thing the meter can see — the hardest thing to catch, at the worst moment to catch
-    /// it.
+    /// from a cold start. The detector reads frame 0 before it has a frame to report it
+    /// against, which is why frame 0 is tested separately from frame 1. The burst is
+    /// Nyquist-alternating because an interpolating lowpass is in its own transition band
+    /// there, which leaves the sample-peak floor as the only thing the meter can see — the
+    /// hardest thing to catch, at the worst moment to catch it. The single sample is the
+    /// opposite case: a crest the interpolator sees in full.
     ///
     /// Measured with a second meter rather than `r.post_dbtp`, because the limiter's own
     /// optics are the thing under test and would agree with whatever they did wrong. The
@@ -1299,35 +1354,42 @@ mod tests {
     /// numbers, not fudge.
     #[test]
     fn a_peak_inside_the_filter_depth_is_limited_where_it_lands() {
-        let mut x = vec![0.0f64; 4096];
-        for (i, slot) in x.iter_mut().enumerate().take(9).skip(1) {
-            *slot = if i % 2 == 0 { -4.0 } else { 4.0 };
-        }
         let mut worst = f64::NEG_INFINITY;
         let mut detail = String::new();
-        for &ratio in Ratio::ALL.iter() {
-            let (out, r) = run(
-                cfg(-3.0, ratio, MIN_LOOKAHEAD_MS),
-                std::slice::from_ref(&x),
-                777,
-            );
-            let mut meter = TruePeak::new(Ratio::X8, 1);
-            meter.push_ch(0, &out[0]);
-            meter.drain();
-            let got = meter.dbtp();
-            // What the ceiling permits, in reading terms: the limiter may under-read the
-            // crest by up to its guard band and still have done its duty, and the meter
-            // doing this measurement has an error of its own in the other direction.
-            let allowed = -3.0 + r.guard_db + Ratio::X8.worst_overread_db();
-            if got - allowed > worst {
-                worst = got - allowed;
-                detail = format!(
-                    "{ratio}: measured {got:+.3} dBTP, allowed {allowed:+.3} (guard {:.3} + \
-                     meter over-read {:.3}), reduction {:.3} dB",
-                    r.guard_db,
-                    Ratio::X8.worst_overread_db(),
-                    r.max_gain_reduction_db
-                );
+        for start in [0usize, 1] {
+            let mut burst = vec![0.0f64; 4096];
+            for (i, slot) in burst.iter_mut().enumerate().skip(start).take(8) {
+                *slot = if i % 2 == 0 { -4.0 } else { 4.0 };
+            }
+            let mut impulse = vec![0.0f64; 4096];
+            impulse[start] = 4.0;
+            for (name, x) in [("burst", &burst), ("impulse", &impulse)] {
+                for &ratio in Ratio::ALL.iter() {
+                    for lookahead in [MIN_LOOKAHEAD_MS, DEFAULT_LOOKAHEAD_MS] {
+                        let (out, r) =
+                            run(cfg(-3.0, ratio, lookahead), std::slice::from_ref(x), 777);
+                        let mut meter = TruePeak::new(Ratio::X8, 1);
+                        meter.push_ch(0, &out[0]);
+                        meter.drain();
+                        let got = meter.dbtp();
+                        // What the ceiling permits, in reading terms: the limiter may
+                        // under-read the crest by up to its guard band and still have done
+                        // its duty, and the meter doing this measurement has an error of its
+                        // own in the other direction.
+                        let allowed = -3.0 + r.guard_db + Ratio::X8.worst_overread_db();
+                        if got - allowed > worst {
+                            worst = got - allowed;
+                            detail = format!(
+                                "{ratio} {name} at frame {start}, lookahead {lookahead} ms: \
+                                 measured {got:+.3} dBTP, allowed {allowed:+.3} (guard {:.3} \
+                                 + meter over-read {:.3}), reduction {:.3} dB",
+                                r.guard_db,
+                                Ratio::X8.worst_overread_db(),
+                                r.max_gain_reduction_db
+                            );
+                        }
+                    }
+                }
             }
         }
         assert!(
@@ -1425,6 +1487,31 @@ mod tests {
                 .fold(0.0f64, |m, (&u, &v)| m.max((u - v).abs()));
             assert!(diff == 0.0, "chunk {chunk} differs by {diff}");
             assert_eq!(ra.max_gain_reduction_db, rb.max_gain_reduction_db);
+        }
+    }
+
+    /// The readings the detector makes before frame 0 has a report of its own are folded
+    /// into frame 0, so that fold must not depend on where the blocks are cut either.
+    #[test]
+    fn a_crest_on_frame_zero_is_chunk_size_invariant() {
+        let mut l = vec![0.0f64; 2048];
+        let mut r = vec![0.0f64; 2048];
+        l[0] = 4.0;
+        for (i, slot) in r.iter_mut().enumerate().take(8) {
+            *slot = if i % 2 == 0 { -2.0 } else { 2.0 };
+        }
+        let planar = [l, r];
+        for &ratio in Ratio::ALL.iter() {
+            let c = Cfg {
+                ratio,
+                ..Cfg::default()
+            };
+            let (a, ra) = run(c, &planar, 4096);
+            for chunk in [1usize, 2, 29, 441] {
+                let (b, rb) = run(c, &planar, chunk);
+                assert_eq!(a, b, "{ratio}: chunk {chunk} changed the output");
+                assert_eq!(ra, rb, "{ratio}: chunk {chunk} changed the report");
+            }
         }
     }
 
@@ -1637,7 +1724,7 @@ mod tests {
                 0.0
             } else {
                 let k = ((i - onset) as f64 / 100.0).min(1.0);
-                0.5 * (1.0 - (PI * (1.0 - k)).cos())
+                0.5 * (1.0 - (PI * k).cos())
             };
             let t = i as f64;
             l[i] = env * (TAU * 0.3 * t).sin();
@@ -1739,7 +1826,11 @@ mod tests {
         assert!(cfg(-1.0, Ratio::X4, 3.0).validate().is_err());
         assert!(cfg(f64::NAN, Ratio::X4, 1.0).validate().is_err());
         // Disabled, nothing is checked: an unset ceiling must not block a render.
-        assert!(Cfg::default().validate().is_ok());
+        let off = Cfg {
+            enable: false,
+            ..cfg(f64::NAN, Ratio::X4, 0.05)
+        };
+        assert!(off.validate().is_ok());
     }
 
     /// The end of the file is inside the ceiling claim, not outside it.

@@ -217,8 +217,9 @@ pub fn derived_taps(_upsample: usize) -> usize {
 /// A polyphase interpolator for `upsample` phases: a Kaiser-windowed sinc low-pass with
 /// its cutoff at fs/2, a pass band to [`BAND_EDGE`] and a stop band from `1 - BAND_EDGE`.
 ///
-/// Phase `p` estimates the waveform at `p / upsample` of an input interval past the
-/// current one, so its taps are that fractional delay's sinc, windowed and truncated
+/// Phase `p` estimates the waveform `((upsample-1)/2 - p) / upsample` of an input interval
+/// after the centre tap, so the phase grid is centred on it and a larger `p` is an
+/// *earlier* instant. Its taps are that fractional delay's sinc, windowed and truncated
 /// to `taps`:
 ///
 /// ```text
@@ -1468,8 +1469,11 @@ mod tests {
                 }
             }
             let want = r.group_delay();
+            // Measured: index 25 for every derived bank (exactly `(taps - 1) / 2`), and 6
+            // against 5.875 for the printed x4 bank, so the dominant tap is the nearest
+            // whole sample to the group delay and a one-sample error fails.
             assert!(
-                (best.0 as f64 - want).abs() <= 1.0 + want * 0.35,
+                (best.0 as f64 - want).abs() < 0.5,
                 "{r}: dominant tap is branch index {}, group delay says {want:.3}",
                 best.0
             );

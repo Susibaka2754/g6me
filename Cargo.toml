@@ -31,5 +31,5 @@ codegen-units = 1
 # already compiles `+ - *` with fp-contract=off (no FMA contraction), which is
 # what keeps the port bit-identical to the C reference. Do not add
 # `-C target-cpu=native` + fma, `-C llvm-args=--fp-contract=fast`, or any
-# fast-math here; crates/g6me-verify/tests/asm_guard.rs fails the build if FMA
+# fast-math here; the `asm` group of g6me-verify (crates/g6me-verify/src/checks.rs) fails if FMA
 # ever shows up in the DSP disassembly.

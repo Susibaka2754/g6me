@@ -1048,9 +1048,10 @@ fn scan_binary(what: &str, path: &PathBuf, want_symbols: &[&str], expect: Expect
     let mut inspected = 0usize;
     let mut insides = 0usize;
     for line in txt.lines() {
-        if let Some(start) = line.find('<') {
-            let sym = &line[start + 1..];
-            let sym = sym.split('>').next().unwrap_or("");
+        // A symbol header is `<address> <name>:` and nothing else. Instruction lines
+        // carry `<sym+off>` annotations too (rip-relative loads, call targets); treating
+        // those as headers skipped exactly the FMA lines that load a constant.
+        if let Some(sym) = symbol_header(line) {
             inside = want_symbols.iter().any(|w| sym.contains(w));
             if inside {
                 inspected += 1;
@@ -1061,16 +1062,7 @@ fn scan_binary(what: &str, path: &PathBuf, want_symbols: &[&str], expect: Expect
             continue;
         }
         insides += 1;
-        // The mnemonic is the last tab-separated field on an instruction line.
-        let mnem = line
-            .rsplit('\t')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .split([' ', '%'])
-            .next()
-            .unwrap_or("");
-        if fma_mnemonics.iter().any(|m| mnem.starts_with(m)) {
+        if fma_mnemonics.iter().any(|m| mnemonic(line).starts_with(m)) {
             hits += 1;
         }
     }
@@ -1113,6 +1105,24 @@ fn scan_binary(what: &str, path: &PathBuf, want_symbols: &[&str], expect: Expect
              different transformation",
         ),
     }
+}
+
+/// `    1194:\tvfmadd132sd 0xe6b(%rip),...` -> `vfmadd132sd`: the first word after the
+/// address. (GNU objdump separates mnemonic and operands with a space, llvm-objdump
+/// with a tab, so "the last tab-separated field" is the operands for one of them.)
+fn mnemonic(line: &str) -> &str {
+    line.split_once(':')
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .unwrap_or("")
+}
+
+/// `0000000000001190 <g6ct_process>:` -> `g6ct_process`.
+fn symbol_header(line: &str) -> Option<&str> {
+    let (addr, rest) = line.trim_end().split_once(' ')?;
+    if addr.is_empty() || !addr.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    rest.strip_prefix('<')?.strip_suffix(">:")
 }
 
 fn find_objdump() -> Option<String> {
@@ -1162,6 +1172,25 @@ fn fmt_f(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disassembly_lines_are_classified_by_shape_not_by_angle_brackets() {
+        // GNU objdump on a function whose FMA loads its constant rip-relative.
+        let fma =
+            "    1194:\tvfmadd132sd 0xe6b(%rip),%xmm1,%xmm0        # 2008 <_IO_stdin_used+0x8>";
+        assert_eq!(symbol_header(fma), None);
+        assert_eq!(mnemonic(fma), "vfmadd132sd");
+        assert_eq!(
+            symbol_header("0000000000001190 <g6ct_process>:"),
+            Some("g6ct_process")
+        );
+        assert_eq!(symbol_header("    11a0:\tcall   1050 <memcpy@plt>"), None);
+        // llvm-objdump separates mnemonic and operands with a tab.
+        assert_eq!(
+            mnemonic("    1194:      \tvfmadd231sd\t%xmm2, %xmm1, %xmm0"),
+            "vfmadd231sd"
+        );
+    }
 
     #[test]
     fn slot_tables_match_the_reference_cli() {

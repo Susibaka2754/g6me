@@ -125,7 +125,8 @@ pub struct Settings {
     pub use_ir_dry: bool,
     pub ir_minp: u32,
     pub ir_maxp: u32,
-    /// `length` in seconds; `0` means "let afir decide".
+    /// `afir`'s `length`: a fraction of the IR, not a duration. `0` means "the whole IR",
+    /// which is what the option already defaults to, so it is sent as absent.
     pub ir_length: f64,
 
     // ---- advanced ----------------------------------------------------------

@@ -528,7 +528,11 @@ pub fn probe_audio(tools: &Tools, path: &Path, pick: usize) -> Result<AudioInfo>
         ])
         .arg("-select_streams")
         .arg(format!("a:{pick}"))
-        .arg(path)
+        // The user's own file name, so ffprobe obeys the same rule as ffmpeg: it parses
+        // `[protocol:]target` before it looks at the filesystem, and answers "Protocol
+        // not found" for a relative name holding a colon. Measured: `ffprobe a:b.wav`
+        // fails that way while `ffprobe ./a:b.wav` reads the file.
+        .arg(crate::util::ffmpeg_path_arg(path))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -588,10 +592,15 @@ pub(crate) fn probe_dir(tag: &str) -> std::result::Result<PathBuf, String> {
 pub(crate) fn tail(bytes: &[u8], max: usize) -> String {
     let s = String::from_utf8_lossy(bytes);
     if s.len() <= max {
-        s.into_owned()
-    } else {
-        s[s.len() - max..].to_string()
+        return s.into_owned();
     }
+    // A byte offset can land inside a multi-byte character (any non-ASCII path in an
+    // ffmpeg message), and slicing there panics.
+    let mut cut = s.len() - max;
+    while !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    s[cut..].to_string()
 }
 
 #[cfg(test)]
@@ -634,6 +643,14 @@ mod tests {
     fn tail_bounds() {
         assert_eq!(tail(b"hello", 10), "hello");
         assert_eq!(tail(b"0123456789abcdef", 4), "cdef");
+        // Every cut position through two-byte characters: none may panic, and the result
+        // never exceeds the budget.
+        let s = "Музыка/трек.flac: Invalid data".as_bytes();
+        for max in 1..s.len() {
+            let t = tail(s, max);
+            assert!(t.len() <= max, "{max}: {t}");
+            assert!(s.ends_with(t.as_bytes()));
+        }
     }
 
     /// Real probe against the local ffmpeg, skipped when it is absent.

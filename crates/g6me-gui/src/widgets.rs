@@ -944,8 +944,7 @@ impl Browser {
                 (idx, from)
             };
             let mut got: Vec<PathBuf> = Vec::new();
-            for i in a..=b {
-                let p = &self.entries[i];
+            for p in &self.entries[a..=b] {
                 // Folders are skipped: they cannot go in the queue, and a range that
                 // appeared to select one would look like it worked and then drop it.
                 if !p.is_dir() {

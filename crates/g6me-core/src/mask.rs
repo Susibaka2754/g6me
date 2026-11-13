@@ -172,40 +172,39 @@ pub const ORDERS: &[(&str, &[Slot])] = &[
 /// instead of guessing and folding a surround channel into the wrong ear.
 pub fn order_from_layout(layout: Option<&str>, channels: usize) -> Option<Vec<Slot>> {
     use Slot::*;
+    // Exactly ffmpeg's standard layouts (`ffmpeg -layouts`), each in the native order the
+    // decoder emits its planes: ascending channel id, which is ascending slot bit here.
+    // Membership matters as much as order: the decode chain relabels the planes with this
+    // order, so a name read as the wrong channel set routes a speaker to the wrong slot.
     let named: &[(&str, &[Slot])] = &[
         ("mono", &[Fc]),
         ("stereo", &[Fl, Fr]),
         ("2.1", &[Fl, Fr, Lfe]),
         ("3.0", &[Fl, Fr, Fc]),
         ("3.0(back)", &[Fl, Fr, Bc]),
+        ("4.0", &[Fl, Fr, Fc, Bc]),
         ("quad", &[Fl, Fr, Bl, Br]),
-        ("4.0", &[Fl, Fr, Bl, Br]),
-        ("4.0(front)", &[Fl, Fr, Flc, Frc]),
         ("quad(side)", &[Fl, Fr, Sl, Sr]),
+        ("3.1", &[Fl, Fr, Fc, Lfe]),
         ("5.0", &[Fl, Fr, Fc, Bl, Br]),
         ("5.0(side)", &[Fl, Fr, Fc, Sl, Sr]),
+        ("4.1", &[Fl, Fr, Fc, Lfe, Bc]),
         ("5.1", &[Fl, Fr, Fc, Lfe, Bl, Br]),
         ("5.1(side)", &[Fl, Fr, Fc, Lfe, Sl, Sr]),
-        ("6.0", &[Fl, Fr, Fc, Bl, Br, Bc]),
-        ("6.0(front)", &[Fl, Fr, Fc, Flc, Frc, Bc]),
+        ("6.0", &[Fl, Fr, Fc, Bc, Sl, Sr]),
+        ("6.0(front)", &[Fl, Fr, Flc, Frc, Sl, Sr]),
         ("hexagonal", &[Fl, Fr, Fc, Bl, Br, Bc]),
-        // Ascending slot-bit order, because that is the order the decoder hands the planes
-        // over. These five were written in the order the layout reads in prose ("BL BC BR")
-        // rather than the order it is stored, which put the sixth plane of a 6.1 file on
-        // rear-centre when it is rear-right, and vice versa.
-        ("6.1", &[Fl, Fr, Fc, Lfe, Bl, Br, Bc]),
+        ("6.1", &[Fl, Fr, Fc, Lfe, Bc, Sl, Sr]),
         ("6.1(back)", &[Fl, Fr, Fc, Lfe, Bl, Br, Bc]),
-        ("6.1(front)", &[Fl, Fr, Fc, Lfe, Flc, Frc, Bc]),
+        ("6.1(front)", &[Fl, Fr, Lfe, Flc, Frc, Sl, Sr]),
         ("7.0", &[Fl, Fr, Fc, Bl, Br, Sl, Sr]),
-        ("7.0(front)", &[Fl, Fr, Fc, Bl, Br, Flc, Frc]),
+        ("7.0(front)", &[Fl, Fr, Fc, Flc, Frc, Sl, Sr]),
         ("7.1", &[Fl, Fr, Fc, Lfe, Bl, Br, Sl, Sr]),
-        // The name ffmpeg's own parser accepts for the same layout, and the one some
-        // taggers write. Refusing it would refuse real 8-channel files over a synonym.
+        // Not one of ffmpeg's names, but one some taggers write for the same layout.
         ("7.1(side)", &[Fl, Fr, Fc, Lfe, Bl, Br, Sl, Sr]),
         ("7.1(wide)", &[Fl, Fr, Fc, Lfe, Bl, Br, Flc, Frc]),
-        ("7.1(wide-side)", &[Fl, Fr, Fc, Lfe, Bl, Br, Sl, Sr]),
-        ("octal", &[Fl, Fr, Fc, Bl, Br, Flc, Frc, Bc]),
-        ("octagon", &[Fl, Fr, Fc, Bl, Br, Flc, Frc, Bc]),
+        ("7.1(wide-side)", &[Fl, Fr, Fc, Lfe, Flc, Frc, Sl, Sr]),
+        ("octagonal", &[Fl, Fr, Fc, Bl, Br, Bc, Sl, Sr]),
     ];
 
     if let Some(l) = layout {
@@ -294,10 +293,11 @@ mod tests {
             ("3.0(back)", 3),
             ("quad", 4),
             ("4.0", 4),
-            ("4.0(front)", 4),
             ("quad(side)", 4),
+            ("3.1", 4),
             ("5.0", 5),
             ("5.0(side)", 5),
+            ("4.1", 5),
             ("5.1", 6),
             ("5.1(side)", 6),
             ("6.0", 6),
@@ -311,8 +311,7 @@ mod tests {
             ("7.1", 8),
             ("7.1(wide)", 8),
             ("7.1(wide-side)", 8),
-            ("octal", 8),
-            ("octagon", 8),
+            ("octagonal", 8),
         ];
         for (name, want) in names {
             let got = order_from_layout(Some(name), want)
@@ -356,6 +355,42 @@ mod tests {
     fn mono_is_not_downmixable() {
         assert!(!is_downmixable(&[Fc]));
         assert!(is_downmixable(&[Fl, Fr]));
+    }
+
+    /// The table must say what ffmpeg says each name means. Skipped (with a note) when no
+    /// ffmpeg is on PATH, like the other tests that need one.
+    #[test]
+    fn layout_table_agrees_with_ffmpeg() {
+        let Ok(out) = std::process::Command::new("ffmpeg")
+            .args(["-hide_banner", "-layouts"])
+            .output()
+        else {
+            eprintln!("skipped: no ffmpeg on PATH");
+            return;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut checked = 0;
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(name), Some(decomp), None) = (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let Some(want) = decomp
+                .split('+')
+                .map(Slot::parse)
+                .collect::<Option<Vec<Slot>>>()
+            else {
+                continue; // uses speakers outside the module's table (tops, wides, ...)
+            };
+            let got = order_from_layout(Some(name), want.len());
+            assert_eq!(got, Some(want), "ffmpeg's '{name}' is {decomp}");
+            checked += 1;
+        }
+        assert!(
+            checked >= 25,
+            "only {checked} layouts compared; parsing broke?"
+        );
     }
 
     #[test]
